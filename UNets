@@ -1,0 +1,89 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch.optim import Adam
+
+# Visualization tools
+import graphviz
+from torchview import draw_graph
+import torchvision
+import torchvision.transforms as transforms
+import matplotlib.pyplot as plt
+
+!nvidia-smi
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.cuda.is_available()
+
+#FashionMNIST is a good default for image classification 
+train_set = torchvision.datasets.FashionMNIST(
+    "./data/", download=True, transform=transforms.Compose([transforms.ToTensor()])
+)
+NUM_CLASSES = 10
+
+# Adjust for display; high w/h ratio recommended
+# running this block shows some of the images that we are working with
+plt.figure(figsize=(16, 1))
+
+def show_images(dataset, num_samples=10):
+    for i, img in enumerate(dataset):
+        if i == num_samples:
+            return
+        plt.subplot(1, num_samples, i + 1)
+        plt.imshow(torch.squeeze(img[0]))
+
+show_images(train_set)
+
+# common to continually halve feature map in Unets with Max Pooling
+# feature map size is then doubled with transposed convolution
+IMG_SIZE = 16 # Due to stride and pooling, must be divisible by 2 multiple times
+IMG_CH = 1 # Black and white image, no color channels
+BATCH_SIZE = 128
+
+def load_fashionMNIST(data_transform, train=True):
+    return torchvision.datasets.FashionMNIST(
+        "./",
+        download=True,
+        train=train,
+        transform=data_transform,
+    )
+
+
+def load_transformed_fashionMNIST():
+    data_transforms = [
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.ToTensor(),  # Scales data into [0,1]
+        transforms.RandomHorizontalFlip(),
+        transforms.Lambda(lambda t: (t * 2) - 1)  # Scale between [-1, 1]
+    ]
+
+    data_transform = transforms.Compose(data_transforms)
+    train_set = load_fashionMNIST(data_transform, train=True)
+    test_set = load_fashionMNIST(data_transform, train=False)
+    return torch.utils.data.ConcatDataset([train_set, test_set])
+
+data = load_transformed_fashionMNIST()
+dataloader = DataLoader(data, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+
+class DownBlock(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        kernel_size = 3
+        stride = 1
+        padding = 1
+
+        super().__init__()
+        layers = [
+            nn.Conv2d(in_ch, out_ch, kernel_size, stride, padding),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(),
+            nn.Conv2d(out_ch, out_ch, kernel_size, stride, padding),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(),
+            nn.MaxPool2d(2)
+        ]
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.model(x)
+
