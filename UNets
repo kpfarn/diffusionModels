@@ -66,6 +66,7 @@ def load_transformed_fashionMNIST():
 data = load_transformed_fashionMNIST()
 dataloader = DataLoader(data, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
 
+#reduces size of feature map
 class DownBlock(nn.Module):
     def __init__(self, in_ch, out_ch):
         kernel_size = 3
@@ -87,3 +88,208 @@ class DownBlock(nn.Module):
     def forward(self, x):
         return self.model(x)
 
+
+ch, h, w = 1, 3, 3
+x = torch.ones(1, ch, h, w)
+x
+
+kernel = torch.tensor([[1.]])  # Identity kernel
+kernel = kernel.view(1, 1, 1, 1).repeat(1, ch, 1, 1) # Make into a batch
+
+output = F.conv_transpose2d(x, kernel, stride=1, padding=0, output_padding=0)[0]
+output
+
+kernel_size = 3
+kernel = torch.ones(1, 1, kernel_size, kernel_size)
+
+output = F.conv_transpose2d(x, kernel, stride=1, padding=0, output_padding=0)[0]
+output
+
+
+#doubles back up the size of the feature map
+#by way of reminder, convolution reduces spatial dimensions, and transposed convolution does the opposite
+class UpBlock(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        # Convolution variables
+        kernel_size = 3
+        stride = 1
+        padding = 1
+
+        # Transpose variables
+        strideT = 2
+        out_paddingT = 1
+
+        super().__init__()
+        # 2 * in_chs for concatednated skip connection
+        layers = [
+            nn.ConvTranspose2d(2 * in_ch, out_ch, kernel_size, strideT, padding, out_paddingT),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(),
+            nn.Conv2d(out_ch, out_ch, kernel_size, stride, padding),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU()
+        ]
+        self.model = nn.Sequential(*layers)
+    
+    def forward(self, x, skip):
+        x = torch.cat((x, skip), 1)
+        x = self.model(x)
+        return x
+
+class UNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        img_ch = IMG_CH
+        down_chs = (16, 32, 64)
+        up_chs = down_chs[::-1]  # Reverse of the down channels
+        latent_image_size = IMG_SIZE // 4 # 2 ** (len(down_chs) - 1)
+
+        # Inital convolution
+        self.down0 = nn.Sequential(
+            nn.Conv2d(img_ch, down_chs[0], 3, padding=1),
+            nn.BatchNorm2d(down_chs[0]),
+            nn.ReLU()
+        )
+
+        # Downsample
+        self.down1 = DownBlock(down_chs[0], down_chs[1])
+        self.down2 = DownBlock(down_chs[1], down_chs[2])
+        self.to_vec = nn.Sequential(nn.Flatten(), nn.ReLU())
+        
+        # Embeddings
+        self.dense_emb = nn.Sequential(
+            nn.Linear(down_chs[2]*latent_image_size**2, down_chs[1]),
+            nn.ReLU(),
+            nn.Linear(down_chs[1], down_chs[1]),
+            nn.ReLU(),
+            nn.Linear(down_chs[1], down_chs[2]*latent_image_size**2),
+            nn.ReLU()
+        )
+        
+        # Upsample
+        self.up0 = nn.Sequential(
+            nn.Unflatten(1, (up_chs[0], latent_image_size, latent_image_size)),
+            nn.Conv2d(up_chs[0], up_chs[0], 3, padding=1),
+            nn.BatchNorm2d(up_chs[0]),
+            nn.ReLU(),
+        )
+        self.up1 = UpBlock(up_chs[0], up_chs[1])
+        self.up2 = UpBlock(up_chs[1], up_chs[2])
+
+        # Match output channels
+        self.out = nn.Sequential(
+            nn.Conv2d(up_chs[-1], up_chs[-1], 3, 1, 1),
+            nn.BatchNorm2d(up_chs[-1]),
+            nn.ReLU(),
+            nn.Conv2d(up_chs[-1], img_ch, 3, 1, 1),
+        )
+
+    def forward(self, x):
+        down0 = self.down0(x)
+        down1 = self.down1(down0)
+        down2 = self.down2(down1)
+        latent_vec = self.to_vec(down2)
+
+        up0 = self.up0(latent_vec)
+        up1 = self.up1(up0, down2)
+        up2 = self.up2(up1, down1)
+        return self.out(up2)
+
+model = UNet()
+print("Num params: ", sum(p.numel() for p in model.parameters()))
+
+graphviz.set_jupyter_format('png')
+model_graph = draw_graph(
+    model,
+    input_size=(BATCH_SIZE, IMG_CH, IMG_SIZE, IMG_SIZE),
+    device='meta',
+    expand_nested=True
+)
+model_graph.resize_graph(scale=1.5)
+model_graph.visual_graph
+
+model = torch.compile(UNet().to(device))
+
+#Training
+def add_noise(imgs):
+    dev = imgs.device
+    percent = .5 # Try changing from 0 to 1
+    beta = torch.tensor(percent, device=dev)
+    alpha = torch.tensor(1 - percent, device=dev)
+    noise = torch.randn_like(imgs)
+    return alpha * imgs + beta * noise
+
+def get_loss(model, imgs):
+    imgs_noisy = add_noise(imgs)
+    imgs_pred = model(imgs_noisy)
+    return F.mse_loss(imgs, imgs_pred)
+
+def show_tensor_image(image):
+    reverse_transforms = transforms.Compose([
+        transforms.Lambda(lambda t: (t + 1) / 2),
+        transforms.Lambda(lambda t: torch.minimum(torch.tensor([1]), t)),
+        transforms.Lambda(lambda t: torch.maximum(torch.tensor([0]), t)),
+        transforms.ToPILImage(),
+    ])
+    plt.imshow(reverse_transforms(image[0].detach().cpu()))
+
+# @torch.no_grad will skip using this function for calculating the gradient during training.
+@torch.no_grad()
+def plot_sample(imgs):
+    # Take first image of batch
+    imgs = imgs[[0], :, :, :]
+    imgs_noisy = add_noise(imgs[[0], :, :, :])
+    imgs_pred = model(imgs_noisy)
+
+    nrows = 1
+    ncols = 3
+    samples = {
+        "Original" : imgs,
+        "Noise Added" : imgs_noisy,
+        "Predicted Original" : imgs_pred
+    }
+    for i, (title, img) in enumerate(samples.items()):
+        ax = plt.subplot(nrows, ncols, i+1)
+        ax.set_title(title)
+        show_tensor_image(img)
+    plt.show()
+
+optimizer = Adam(model.parameters(), lr=0.0001)
+epochs = 2
+
+#run to see how the model improves with training; given image + noise, returns predicted given image
+model.train()
+for epoch in range(epochs):
+    for step, batch in enumerate(dataloader):
+        optimizer.zero_grad()
+
+        images = batch[0].to(device)
+        loss = get_loss(model, images)
+        loss.backward()
+        optimizer.step()
+
+        if epoch % 1 == 0 and step % 100 == 0:
+            print(f"Epoch {epoch} | Step {step:03d} Loss: {loss.item()} ")
+            plot_sample(images)
+
+
+model.eval()
+for _ in range(10):
+    noise = torch.randn((1, IMG_CH, IMG_SIZE, IMG_SIZE), device=device)
+    result = model(noise)
+    nrows = 1
+    ncols = 2
+    samples = {
+        "Noise" : noise,
+        "Generated Image" : result
+    }
+    for i, (title, img) in enumerate(samples.items()):
+        ax = plt.subplot(nrows, ncols, i+1)
+        ax.set_title(title)
+        show_tensor_image(img)
+    plt.show()
+
+#restart jupyter kernel
+import IPython
+app = IPython.Application.instance()
+app.kernel.do_shutdown(True)
