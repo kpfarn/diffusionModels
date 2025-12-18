@@ -1,3 +1,4 @@
+#see FMUNet.png for a visual of the process scripted in this file
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
