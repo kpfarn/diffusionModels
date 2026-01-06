@@ -51,4 +51,53 @@ a_bar = torch.cumprod(a, dim=0)
 sqrt_a_bar = torch.sqrt(a_bar)  # Mean Coefficient
 sqrt_one_minus_a_bar = torch.sqrt(1 - a_bar) # St. Dev. Coefficient
 
+def q(x_0, t):
+    """
+    Samples a new image from q
+    Returns the noise applied to an image at timestep t
+    x_0: the original image
+    t: timestep
+    """
+    t = t.int()
+    noise = torch.randn_like(x_0)
+    sqrt_a_bar_t = sqrt_a_bar[t, None, None, None]
+    sqrt_one_minus_a_bar_t = sqrt_one_minus_a_bar[t, None, None, None]
+
+    x_t = sqrt_a_bar_t * x_0 + sqrt_one_minus_a_bar_t * noise
+    return x_t, noise
+
+plt.figure(figsize=(8, 8))
+xs = []
+
+for t in range(T):
+    t_tenser = torch.Tensor([t]).type(torch.int64)
+    x_t, _ = q(x_0, t_tenser)
+    img = torch.squeeze(x_t).cpu()
+    xs.append(img)
+    ax = plt.subplot(nrows, ncols, t + 1)
+    ax.axis('off')
+    other_utils.show_tensor_image(x_t)
+plt.savefig("forward_diffusion_skip.png", bbox_inches='tight')
+
+#again, the animated form
+gif_name = "forward_diffusion_skip.gif"
+other_utils.save_animation(xs, gif_name)
+Image(open(gif_name,'rb').read())
+
+class EmbedBlock(nn.Module):
+    def __init__(self, input_dim, emb_dim):
+        super().__init__()
+        self.input_dim = input_dim
+        layers = [
+            nn.Linear(input_dim, emb_dim),
+            nn.ReLU(),
+            nn.Linear(emb_dim, emb_dim),
+            nn.Unflatten(1, (emb_dim, 1, 1))
+        ]
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, input):
+        input = input.view(-1, self.input_dim)
+        return self.model(input)
+
 
