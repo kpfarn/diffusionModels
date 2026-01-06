@@ -16,3 +16,39 @@ IMG_CH = 1
 BATCH_SIZE = 128
 data, dataloader = other_utils.load_transformed_fashionMNIST(IMG_SIZE, BATCH_SIZE)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+nrows = 10
+ncols = 15
+
+T = nrows * ncols
+start = 0.0001
+end = 0.02
+B = torch.linspace(start, end, T).to(device)
+B
+
+plt.figure(figsize=(8, 8))
+x_0 = data[0][0].to(device)  # Initial image
+x_t = x_0  # Set up recursion
+xs = []  # Store x_t for each T to see change
+
+for t in range(T):
+    noise = torch.randn_like(x_t)
+    x_t = torch.sqrt(1 - B[t]) * x_t + torch.sqrt(B[t]) * noise  # sample from q(x_t|x_t-1)
+    img = torch.squeeze(x_t).cpu()
+    xs.append(img)
+    ax = plt.subplot(nrows, ncols, t + 1)
+    ax.axis("off")
+    plt.imshow(img)
+plt.savefig("forward_diffusion.png", bbox_inches="tight")
+
+#this does the same thing as the previous block, but as an animation
+gif_name = "forward_diffusion.gif"
+other_utils.save_animation(xs, gif_name)
+Image(open(gif_name,'rb').read())
+
+a = 1. - B
+a_bar = torch.cumprod(a, dim=0)
+sqrt_a_bar = torch.sqrt(a_bar)  # Mean Coefficient
+sqrt_one_minus_a_bar = torch.sqrt(1 - a_bar) # St. Dev. Coefficient
+
+
