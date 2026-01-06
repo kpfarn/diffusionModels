@@ -1,1 +1,18 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.autograd import Variable
+from torch.optim import Adam
 
+# Visualization tools
+import matplotlib.pyplot as plt
+from IPython.display import Image
+
+# User defined libraries
+from utils import other_utils
+
+IMG_SIZE = 16
+IMG_CH = 1
+BATCH_SIZE = 128
+data, dataloader = other_utils.load_transformed_fashionMNIST(IMG_SIZE, BATCH_SIZE)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
