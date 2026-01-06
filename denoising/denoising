@@ -100,4 +100,203 @@ class EmbedBlock(nn.Module):
         input = input.view(-1, self.input_dim)
         return self.model(input)
 
+class DownBlock(nn.Module):
+    def __init__(self, in_chs, out_chs):
+        kernel_size = 3
+        stride = 1
+        padding = 1
 
+        super().__init__()
+        layers = [
+            nn.Conv2d(in_chs, out_chs, kernel_size, stride, padding),
+            nn.BatchNorm2d(out_chs),
+            nn.ReLU(),
+            nn.Conv2d(out_chs, out_chs, kernel_size, stride, padding),
+            nn.BatchNorm2d(out_chs),
+            nn.ReLU(),
+            nn.MaxPool2d(2)
+        ]
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.model(x)
+
+#with transposed convolution
+class UpBlock(nn.Module):
+    def __init__(self, in_chs, out_chs):
+        # Convolution variables
+        kernel_size = 3
+        stride = 1
+        padding = 1
+
+        # Transpose variables
+        strideT = 2
+        out_paddingT = 1
+
+        super().__init__()
+        # 2 * in_chs for concatenated skip connection
+        layers = [
+            nn.ConvTranspose2d(2 * in_chs, out_chs, kernel_size, strideT, padding, out_paddingT),
+            nn.BatchNorm2d(out_chs),
+            nn.ReLU(),
+            nn.Conv2d(out_chs, out_chs, kernel_size, stride, padding),
+            nn.BatchNorm2d(out_chs),
+            nn.ReLU()
+        ]
+        self.model = nn.Sequential(*layers)
+    
+    def forward(self, x, skip):
+        x = torch.cat((x, skip), 1)
+        x = self.model(x)
+        return x
+
+class UNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        img_chs = IMG_CH
+        down_chs = (16, 32, 64)
+        up_chs = down_chs[::-1]  # Reverse of the down channels
+        latent_image_size = IMG_SIZE // 4 # 2 ** (len(down_chs) - 1)
+        t_dim = 1 # New
+
+        # Inital convolution
+        self.down0 = nn.Sequential(
+            nn.Conv2d(img_chs, down_chs[0], 3, padding=1),
+            nn.BatchNorm2d(down_chs[0]),
+            nn.ReLU()
+        )
+
+        # Downsample
+        self.down1 = DownBlock(down_chs[0], down_chs[1])
+        self.down2 = DownBlock(down_chs[1], down_chs[2])
+        self.to_vec = nn.Sequential(nn.Flatten(), nn.ReLU())
+        
+        # Embeddings
+        self.dense_emb = nn.Sequential(
+            nn.Linear(down_chs[2]*latent_image_size**2, down_chs[1]),
+            nn.ReLU(),
+            nn.Linear(down_chs[1], down_chs[1]),
+            nn.ReLU(),
+            nn.Linear(down_chs[1], down_chs[2]*latent_image_size**2),
+            nn.ReLU()
+        )
+        self.temb_1 = EmbedBlock(t_dim, up_chs[0])  # New
+        self.temb_2 = EmbedBlock(t_dim, up_chs[1])  # New
+        
+        # Upsample
+        self.up0 = nn.Sequential(
+            nn.Unflatten(1, (up_chs[0], latent_image_size, latent_image_size)),
+            nn.Conv2d(up_chs[0], up_chs[0], 3, padding=1),
+            nn.BatchNorm2d(up_chs[0]),
+            nn.ReLU(),
+        )
+        self.up1 = UpBlock(up_chs[0], up_chs[1])
+        self.up2 = UpBlock(up_chs[1], up_chs[2])
+
+        # Match output channels
+        self.out = nn.Sequential(
+            nn.Conv2d(up_chs[-1], up_chs[-1], 3, 1, 1),
+            nn.BatchNorm2d(up_chs[-1]),
+            nn.ReLU(),
+            nn.Conv2d(up_chs[-1], img_chs, 3, 1, 1)
+        )
+
+    def forward(self, x, t):
+        down0 = self.down0(x)
+        down1 = self.down1(down0)
+        down2 = self.down2(down1)
+        latent_vec = self.to_vec(down2)
+        
+        # New
+        t = t.float() / T  # Convert from [0, T] to [0, 1]
+        latent_vec = self.dense_emb(latent_vec)
+        temb_1 = self.temb_1(t)
+        temb_2 = self.temb_2(t)
+
+        up0 = self.up0(latent_vec)
+        up1 = self.up1(up0+temb_1, down2)
+        up2 = self.up2(up1+temb_2, down1)
+        return self.out(up2)
+
+model = UNet()
+print("Num params: ", sum(p.numel() for p in model.parameters()))
+model = torch.compile(UNet().to(device))
+
+#for denoising, MSE is actually better than log-likelihood
+def get_loss(model, x_0, t):
+    x_noisy, noise = q(x_0, t)
+    noise_pred = model(x_noisy, t)
+    return F.mse_loss(noise, noise_pred)
+
+#precompute values needed to calculate u_t
+sqrt_a_inv = torch.sqrt(1 / a)
+pred_noise_coeff = (1 - a) / torch.sqrt(1 - a_bar)
+
+#reverse diffusion func
+@torch.no_grad()
+def reverse_q(x_t, t, e_t):
+    t = torch.squeeze(t[0].int())  # All t values should be the same
+    pred_noise_coeff_t = pred_noise_coeff[t]
+    sqrt_a_inv_t = sqrt_a_inv[t]
+    u_t = sqrt_a_inv_t * (x_t - pred_noise_coeff_t * e_t)
+    if t == 0:
+        return u_t  # Reverse diffusion complete!
+    else:
+        B_t = B[t-1]
+        new_noise = torch.randn_like(x_t)
+        return u_t + torch.sqrt(B_t) * new_noise
+
+@torch.no_grad()
+def sample_images(ncols, figsize=(8,8)):
+    plt.figure(figsize=figsize)
+    plt.axis("off")
+    hidden_rows = T / ncols
+
+    # Noise to generate images from
+    x_t = torch.randn((1, IMG_CH, IMG_SIZE, IMG_SIZE), device=device)
+
+    # Go from T to 0 removing and adding noise until t = 0
+    plot_number = 1
+    for i in range(0, T)[::-1]:
+        t = torch.full((1,), i, device=device)
+        e_t = model(x_t, t)  # Predicted noise
+        x_t = reverse_q(x_t, t, e_t)
+        if i % hidden_rows == 0:
+            ax = plt.subplot(1, ncols+1, plot_number)
+            ax.axis('off')
+            other_utils.show_tensor_image(x_t.detach().cpu())
+            plot_number += 1
+    plt.show()
+
+optimizer = Adam(model.parameters(), lr=0.001)
+epochs = 3
+ncols = 15  # Should evenly divide T
+
+model.train()
+for epoch in range(epochs):
+    for step, batch in enumerate(dataloader):
+        optimizer.zero_grad()
+
+        t = torch.randint(0, T, (BATCH_SIZE,), device=device)
+        x = batch[0].to(device)
+        loss = get_loss(model, x, t)
+        loss.backward()
+        optimizer.step()
+
+        if epoch % 1 == 0 and step % 100 == 0:
+            print(f"Epoch {epoch} | Step {step:03d} | Loss: {loss.item()} ")
+            sample_images(ncols)
+print("Final sample:")
+sample_images(ncols)
+
+model.eval()
+figsize=(8,8) # Change me
+ncols = 3 # Should evenly divide T
+for _ in range(10):
+    sample_images(ncols, figsize=figsize)
+
+# yes, learning, but still pixelated
+
+import IPython
+app = IPython.Application.instance()
+app.kernel.do_shutdown(True)
